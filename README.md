@@ -1,5 +1,7 @@
 <h1 align="center">Koharu</h1>
 
+<p align="center"><a href="README_KO.md">한국어</a> | English</p>
+
 <p align="center">ML-powered manga translator, written in <b>Rust</b>.</p>
 
 <p align="center">
