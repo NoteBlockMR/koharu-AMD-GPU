@@ -40,9 +40,10 @@ koharu_runtime::declare_hf_model_package!(
     order: 117,
 );
 
-#[derive(Debug)]
 pub struct SpeechBubbleSegmentation {
-    model: YoloV8Seg,
+    model: Option<YoloV8Seg>,
+    #[cfg(all(feature = "vulkan-ncnn", target_os = "windows"))]
+    ncnn: Option<crate::comic_text_detector::ncnn::NcnnDetector>,
     config: SpeechBubbleSegmentationConfig,
     device: Device,
     dtype: DType,
@@ -175,11 +176,31 @@ impl SpeechBubbleSegmentation {
         weights_path: impl AsRef<Path>,
         cpu: bool,
     ) -> Result<Self> {
-        let device = device(cpu)?;
-        let dtype = loading::model_dtype(&device);
         let config = loading::read_json::<SpeechBubbleSegmentationConfig>(config_path.as_ref())
             .with_context(|| format!("failed to parse {}", config_path.as_ref().display()))?;
         config.validate()?;
+        #[cfg(all(feature = "vulkan-ncnn", target_os = "windows"))]
+        if !cpu {
+            match crate::comic_text_detector::ncnn::NcnnDetector::load_model(
+                "speech_bubble",
+                "speech-bubble-segmentation",
+            ) {
+                Ok(ncnn) => {
+                    return Ok(Self {
+                        model: None,
+                        ncnn: Some(ncnn),
+                        config,
+                        device: Device::Cpu,
+                        dtype: DType::F32,
+                    });
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "ncnn Vulkan speech bubble backend unavailable")
+                }
+            }
+        }
+        let device = device(cpu)?;
+        let dtype = loading::model_dtype(&device);
         let multiples = variant_multiples(&config)?;
         let model = loading::load_mmaped_safetensors_path_with_dtype(
             weights_path.as_ref(),
@@ -198,7 +219,9 @@ impl SpeechBubbleSegmentation {
         )?;
 
         Ok(Self {
-            model,
+            model: Some(model),
+            #[cfg(all(feature = "vulkan-ncnn", target_os = "windows"))]
+            ncnn: None,
             config,
             device,
             dtype,
@@ -227,7 +250,49 @@ impl SpeechBubbleSegmentation {
         let preprocess_elapsed = preprocess_started.elapsed();
 
         let forward_started = Instant::now();
-        let outputs = self.model.forward(&prepared.pixel_values)?;
+        #[cfg(all(feature = "vulkan-ncnn", target_os = "windows"))]
+        let outputs = if let Some(ncnn) = &self.ncnn {
+            let mut input = prepared.pixel_values.flatten_all()?.to_vec1::<f32>()?;
+            let output = ncnn.forward_outputs(
+                &mut input,
+                self.config.input_size as i32,
+                self.config.input_size as i32,
+                &["out0", "out1"],
+            )?;
+            let anchors = output[0].len() / (4 + self.config.num_classes + self.config.num_masks);
+            let proto_area = output[1].len() / self.config.num_masks;
+            let proto_side = (proto_area as f64).sqrt() as usize;
+            if proto_side * proto_side != proto_area {
+                bail!("unexpected ncnn speech bubble prototype size {proto_area}");
+            }
+            YoloV8SegOutputs {
+                pred: Tensor::from_vec(
+                    output[0].clone(),
+                    (
+                        1,
+                        4 + self.config.num_classes + self.config.num_masks,
+                        anchors,
+                    ),
+                    &Device::Cpu,
+                )?,
+                proto: Tensor::from_vec(
+                    output[1].clone(),
+                    (1, self.config.num_masks, proto_side, proto_side),
+                    &Device::Cpu,
+                )?,
+            }
+        } else {
+            self.model
+                .as_ref()
+                .context("speech bubble backend missing")?
+                .forward(&prepared.pixel_values)?
+        };
+        #[cfg(not(all(feature = "vulkan-ncnn", target_os = "windows")))]
+        let outputs = self
+            .model
+            .as_ref()
+            .context("speech bubble backend missing")?
+            .forward(&prepared.pixel_values)?;
         let forward_elapsed = forward_started.elapsed();
 
         let postprocess_started = Instant::now();

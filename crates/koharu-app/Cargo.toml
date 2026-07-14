@@ -58,3 +58,5 @@ zip = { workspace = true }
 [features]
 cuda = ["koharu-ml/cuda"]
 metal = ["koharu-ml/metal"]
+directml = ["koharu-ml/directml"]
+vulkan-ncnn = ["koharu-ml/vulkan-ncnn"]

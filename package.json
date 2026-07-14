@@ -5,6 +5,7 @@
   "scripts": {
     "dev": "bun run scripts/dev.ts tauri dev -- --profile=release-with-debug",
     "build": "bun run scripts/dev.ts tauri build --no-bundle",
+    "build:directml": "bun run scripts/dev.ts tauri build --no-bundle --config crates/koharu/tauri.directml.conf.json",
     "cargo": "bun run scripts/dev.ts cargo",
     "lint:ui": "bun run --filter ui lint",
     "test:ui": "bun run --filter ui test",

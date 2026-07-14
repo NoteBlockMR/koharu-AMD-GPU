@@ -182,6 +182,9 @@ pub async fn run(
                 continue 'pages;
             }
 
+            if info.id == "lama-manga" {
+                registry.prepare_exclusive(info.id);
+            }
             let engine = match registry.get(info.id, &runtime, cpu).await {
                 Ok(e) => e,
                 Err(err) => {

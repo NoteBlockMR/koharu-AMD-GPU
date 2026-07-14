@@ -91,6 +91,16 @@ bun cargo build --release -p koharu --features=cuda
 bun cargo build --release -p koharu --features=metal
 ```
 
+For a Windows AMD build that does not require the CUDA toolkit, run:
+
+```powershell
+bun run build:directml
+```
+
+The DirectML backend currently accelerates LaMa inpainting. Other Candle-based
+vision models retain their existing backend or CPU fallback, while the local
+LLM continues to use its Vulkan runtime on AMD systems.
+
 This is useful for lower-level Rust work, but `bun run build` remains the better choice for a normal desktop build because it preserves the full Tauri packaging flow.
 
 ## What happens at runtime after the build

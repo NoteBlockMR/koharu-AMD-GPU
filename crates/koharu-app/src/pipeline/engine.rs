@@ -139,6 +139,18 @@ impl Registry {
         self.engines.write().clear();
     }
 
+    /// Free other cached engines before loading a memory-intensive exclusive
+    /// engine. Keep it cached when processing subsequent pages.
+    pub fn prepare_exclusive(&self, id: &str) {
+        if !self.engines.read().contains_key(id) {
+            tracing::info!(
+                engine = id,
+                "clearing cached engines for exclusive GPU load"
+            );
+            self.clear();
+        }
+    }
+
     /// Find engine descriptor by id.
     pub fn find(id: &str) -> Result<&'static EngineInfo> {
         Self::catalog()

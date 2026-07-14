@@ -1,4 +1,6 @@
 mod dbnet;
+#[cfg(all(feature = "vulkan-ncnn", target_os = "windows"))]
+pub(crate) mod ncnn;
 mod postprocess;
 mod unet;
 mod yolo_v5;
@@ -53,9 +55,11 @@ koharu_runtime::declare_hf_model_package!(
 );
 
 pub struct ComicTextDetector {
-    yolo: yolo_v5::YoloV5,
-    unet: unet::UNet,
+    yolo: Option<yolo_v5::YoloV5>,
+    unet: Option<unet::UNet>,
     dbnet: Option<dbnet::DbNet>,
+    #[cfg(all(feature = "vulkan-ncnn", target_os = "windows"))]
+    ncnn: Option<std::sync::Mutex<ncnn::NcnnDetector>>,
     device: Device,
     dtype: DType,
 }
@@ -77,6 +81,24 @@ impl ComicTextDetector {
         cpu: bool,
         load_dbnet: bool,
     ) -> anyhow::Result<Self> {
+        #[cfg(all(feature = "vulkan-ncnn", target_os = "windows"))]
+        if !cpu {
+            match ncnn::NcnnDetector::load() {
+                Ok(ncnn) => {
+                    return Ok(Self {
+                        yolo: None,
+                        unet: None,
+                        dbnet: None,
+                        ncnn: Some(std::sync::Mutex::new(ncnn)),
+                        device: Device::Cpu,
+                        dtype: DType::F32,
+                    });
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "ncnn Vulkan initialization failed; falling back to Candle")
+                }
+            }
+        }
         let device = device(cpu)?;
         let dtype = loading::model_dtype(&device);
         let downloads = runtime.downloads();
@@ -111,9 +133,11 @@ impl ComicTextDetector {
         };
 
         Ok(Self {
-            yolo,
-            unet,
+            yolo: Some(yolo),
+            unet: Some(unet),
             dbnet,
+            #[cfg(all(feature = "vulkan-ncnn", target_os = "windows"))]
+            ncnn: None,
             device,
             dtype,
         })
@@ -122,7 +146,8 @@ impl ComicTextDetector {
     #[instrument(level = "debug", skip_all)]
     pub fn inference(&self, image: &DynamicImage) -> anyhow::Result<ComicTextDetection> {
         let original_dimensions = image.dimensions();
-        let (image_tensor, resized_dimensions) = preprocess(image, &self.device, self.dtype)?;
+        let (image_tensor, resized_dimensions) =
+            preprocess(image, &self.device, self.dtype, self.image_size())?;
         let (predictions, mask, shrink_threshold) = self.forward(&image_tensor)?;
 
         let bboxes = postprocess_yolo(&predictions, original_dimensions, resized_dimensions)?;
@@ -155,15 +180,31 @@ impl ComicTextDetector {
     #[instrument(level = "debug", skip_all)]
     pub fn inference_segmentation(&self, image: &DynamicImage) -> anyhow::Result<GrayImage> {
         let original_dimensions = image.dimensions();
-        let (image_tensor, resized_dimensions) = preprocess(image, &self.device, self.dtype)?;
+        let (image_tensor, resized_dimensions) =
+            preprocess(image, &self.device, self.dtype, self.image_size())?;
         let mask = self.forward_mask(&image_tensor)?;
         postprocess_unet_mask(&mask, original_dimensions, resized_dimensions)
     }
 
     #[instrument(level = "debug", skip_all)]
     fn forward(&self, image: &Tensor) -> anyhow::Result<(Tensor, Tensor, Tensor)> {
-        let (predictions, features) = self.yolo.forward(image)?;
-        let (mask, features) = self.unet.forward(
+        #[cfg(all(feature = "vulkan-ncnn", target_os = "windows"))]
+        if let Some(ncnn) = &self.ncnn {
+            let mut input = image.flatten_all()?.to_vec1::<f32>()?;
+            let (predictions, mask, shrink) = ncnn
+                .lock()
+                .map_err(|_| anyhow::anyhow!("ncnn lock poisoned"))?
+                .forward(&mut input)?;
+            return Ok((
+                Tensor::from_vec(predictions, (1, 64512, 7), &Device::Cpu)?,
+                Tensor::from_vec(mask, (1, 1, 1024, 1024), &Device::Cpu)?,
+                Tensor::from_vec(shrink, (1, 2, 1024, 1024), &Device::Cpu)?,
+            ));
+        }
+        let yolo = self.yolo.as_ref().context("YOLO backend missing")?;
+        let unet = self.unet.as_ref().context("UNet backend missing")?;
+        let (predictions, features) = yolo.forward(image)?;
+        let (mask, features) = unet.forward(
             &features[0],
             &features[1],
             &features[2],
@@ -181,8 +222,19 @@ impl ComicTextDetector {
 
     #[instrument(level = "debug", skip_all)]
     fn forward_mask(&self, image: &Tensor) -> anyhow::Result<Tensor> {
-        let (_, features) = self.yolo.forward(image)?;
-        let (mask, _) = self.unet.forward(
+        #[cfg(all(feature = "vulkan-ncnn", target_os = "windows"))]
+        if let Some(ncnn) = &self.ncnn {
+            let mut input = image.flatten_all()?.to_vec1::<f32>()?;
+            let (_, mask, _) = ncnn
+                .lock()
+                .map_err(|_| anyhow::anyhow!("ncnn lock poisoned"))?
+                .forward(&mut input)?;
+            return Ok(Tensor::from_vec(mask, (1, 1, 1024, 1024), &Device::Cpu)?);
+        }
+        let yolo = self.yolo.as_ref().context("YOLO backend missing")?;
+        let unet = self.unet.as_ref().context("UNet backend missing")?;
+        let (_, features) = yolo.forward(image)?;
+        let (mask, _) = unet.forward(
             &features[0],
             &features[1],
             &features[2],
@@ -191,6 +243,17 @@ impl ComicTextDetector {
         )?;
         Ok(mask)
     }
+
+    fn image_size(&self) -> u32 {
+        #[cfg(all(feature = "vulkan-ncnn", target_os = "windows"))]
+        if self.ncnn.is_some() {
+            return GPU_DETECT_SIZE;
+        }
+        match self.device {
+            Device::Cpu => CPU_DETECT_SIZE,
+            _ => GPU_DETECT_SIZE,
+        }
+    }
 }
 
 #[instrument(level = "debug", skip_all)]
@@ -198,12 +261,9 @@ fn preprocess(
     image: &DynamicImage,
     device: &Device,
     dtype: DType,
+    image_size: u32,
 ) -> anyhow::Result<(Tensor, (u32, u32))> {
     let (orig_w, orig_h) = image.dimensions();
-    let image_size = match device {
-        Device::Cpu => CPU_DETECT_SIZE,
-        _ => GPU_DETECT_SIZE,
-    };
     let (width, height) = if orig_w >= orig_h {
         (image_size, image_size * orig_h / orig_w)
     } else {

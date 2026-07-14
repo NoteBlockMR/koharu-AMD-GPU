@@ -34,7 +34,11 @@ koharu_runtime::declare_hf_model_package!(
 pub use crate::types::{FontPrediction, NamedFontPrediction, TextDirection, TopFont};
 
 pub struct FontDetector {
-    model: models::Model,
+    model: Option<models::Model>,
+    #[cfg(all(feature = "vulkan-ncnn", target_os = "windows"))]
+    ncnn: Option<crate::comic_text_detector::ncnn::NcnnDetector>,
+    #[cfg(all(feature = "directml", target_os = "windows"))]
+    directml: Option<std::sync::Mutex<ort::session::Session>>,
     labels: FontLabels,
     device: Device,
     dtype: DType,
@@ -50,6 +54,73 @@ impl FontDetector {
         cpu: bool,
         kind: ModelKind,
     ) -> Result<Self> {
+        #[cfg(all(feature = "vulkan-ncnn", target_os = "windows"))]
+        if !cpu {
+            match crate::comic_text_detector::ncnn::NcnnDetector::load_model(
+                "font_detector_raw",
+                "yuzumarker-font-detection",
+            ) {
+                Ok(ncnn) => {
+                    return Ok(Self {
+                        model: None,
+                        ncnn: Some(ncnn),
+                        #[cfg(feature = "directml")]
+                        directml: None,
+                        labels: FontLabels::load(runtime).await?,
+                        device: Device::Cpu,
+                        dtype: DType::F32,
+                    });
+                }
+                Err(error) => tracing::warn!(%error, "ncnn Vulkan font backend unavailable"),
+            }
+        }
+        #[cfg(all(feature = "directml", target_os = "windows"))]
+        if !cpu {
+            let root = std::env::var_os("KOHARU_NCNN_ROOT")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| {
+                    PathBuf::from(env!("CARGO_WORKSPACE_DIR")).join("temp/vulkan-pilot")
+                });
+            let onnx = root.join("font-detector.onnx");
+            if onnx.is_file() {
+                let session = (|| -> ort::Result<ort::session::Session> {
+                    let builder = ort::session::Session::builder()?;
+                    let device_id = std::env::var("KOHARU_DIRECTML_DEVICE_ID")
+                        .ok()
+                        .and_then(|value| value.parse::<i32>().ok())
+                        .unwrap_or(0);
+                    let mut builder =
+                        builder.with_execution_providers([ort::ep::DirectML::default()
+                            .with_device_id(device_id)
+                            .build()
+                            .error_on_failure()])?;
+                    builder.commit_from_file(&onnx)
+                })();
+                match session {
+                    Ok(session) => {
+                        tracing::info!(
+                            backend = "directml",
+                            engine = "yuzumarker-font-detection",
+                            "using GPU backend"
+                        );
+                        return Ok(Self {
+                            model: None,
+                            #[cfg(feature = "vulkan-ncnn")]
+                            ncnn: None,
+                            directml: Some(std::sync::Mutex::new(session)),
+                            labels: FontLabels::load(runtime).await?,
+                            device: Device::Cpu,
+                            dtype: DType::F32,
+                        });
+                    }
+                    Err(error) => {
+                        tracing::warn!(%error, "DirectML font backend unavailable");
+                    }
+                }
+            } else {
+                tracing::warn!(path = %onnx.display(), "DirectML font model not found");
+            }
+        }
         let device = device(cpu)?;
         let dtype = loading::model_dtype(&device);
         let downloads = runtime.downloads();
@@ -65,7 +136,11 @@ impl FontDetector {
         let labels = FontLabels::load(runtime).await?;
 
         Ok(Self {
-            model,
+            model: Some(model),
+            #[cfg(all(feature = "vulkan-ncnn", target_os = "windows"))]
+            ncnn: None,
+            #[cfg(all(feature = "directml", target_os = "windows"))]
+            directml: None,
             device,
             dtype,
             labels,
@@ -78,7 +153,7 @@ impl FontDetector {
         }
 
         let started = Instant::now();
-        let input_size = self.model.input_size();
+        let input_size = self.model.as_ref().map_or(512, models::Model::input_size);
         let original_sizes = images
             .iter()
             .map(|image| image.dimensions().0)
@@ -90,21 +165,85 @@ impl FontDetector {
             .collect::<Vec<_>>()
             .into_iter()
             .collect::<Result<Vec<_>>>()?;
-        let batch = Tensor::stack(&processed, 0)?
-            .to_device(&self.device)?
-            .to_dtype(self.dtype)?;
+        let batch = Tensor::stack(&processed, 0)?;
         let preprocess_elapsed = preprocess_started.elapsed();
 
         let forward_started = Instant::now();
-        let logits = self
-            .model
-            .forward(&batch, false)?
-            .to_dtype(DType::F32)?
-            .to_device(&Device::Cpu)?;
+        #[cfg(all(feature = "vulkan-ncnn", target_os = "windows"))]
+        let ncnn_logits = if let Some(ncnn) = &self.ncnn {
+            let mut rows = Vec::with_capacity(images.len() * 6162);
+            for tensor in &processed {
+                let mut input = tensor.flatten_all()?.to_vec1::<f32>()?;
+                let output = ncnn.forward_outputs(
+                    &mut input,
+                    input_size as i32,
+                    input_size as i32,
+                    &["out0"],
+                )?;
+                if output[0].len() != 6162 {
+                    anyhow::bail!("unexpected ncnn font output size: {}", output[0].len());
+                }
+                rows.extend_from_slice(&output[0]);
+            }
+            Some(Tensor::from_vec(rows, (images.len(), 6162), &Device::Cpu)?)
+        } else {
+            None
+        };
+        #[cfg(all(feature = "directml", target_os = "windows"))]
+        let logits = if let Some(logits) = ncnn_logits {
+            logits
+        } else if let Some(session) = &self.directml {
+            let values = batch.flatten_all()?.to_vec1::<f32>()?;
+            let input = ort::value::Tensor::from_array((
+                [images.len(), 3, input_size, input_size],
+                values,
+            ))?;
+            let mut session = session
+                .lock()
+                .map_err(|_| anyhow::anyhow!("DirectML font session lock poisoned"))?;
+            let outputs = session.run(ort::inputs!["input" => input])?;
+            let (shape, values) = outputs[0].try_extract_tensor::<f32>()?;
+            if &shape[..] != [images.len() as i64, 6162].as_slice() {
+                anyhow::bail!("unexpected DirectML font output shape: {shape:?}");
+            }
+            Tensor::from_vec(values.to_vec(), (images.len(), 6162), &Device::Cpu)?
+        } else {
+            self.model
+                .as_ref()
+                .context("font detector backend missing")?
+                .forward(&batch.to_device(&self.device)?.to_dtype(self.dtype)?, false)?
+                .to_dtype(DType::F32)?
+                .to_device(&Device::Cpu)?
+        };
+        #[cfg(not(all(feature = "directml", target_os = "windows")))]
+        let logits = {
+            #[cfg(all(feature = "vulkan-ncnn", target_os = "windows"))]
+            if let Some(logits) = ncnn_logits {
+                logits
+            } else {
+                self.model
+                    .as_ref()
+                    .context("font detector backend missing")?
+                    .forward(&batch.to_device(&self.device)?.to_dtype(self.dtype)?, false)?
+                    .to_dtype(DType::F32)?
+                    .to_device(&Device::Cpu)?
+            }
+            #[cfg(not(all(feature = "vulkan-ncnn", target_os = "windows")))]
+            self.model
+                .as_ref()
+                .context("font detector backend missing")?
+                .forward(&batch.to_device(&self.device)?.to_dtype(self.dtype)?, false)?
+                .to_dtype(DType::F32)?
+                .to_device(&Device::Cpu)?
+        };
         let forward_elapsed = forward_started.elapsed();
 
         let postprocess_started = Instant::now();
         let rows = logits.to_vec2::<f32>()?;
+        #[cfg(all(feature = "directml", target_os = "windows"))]
+        let regression_is_normalized = self.directml.is_some();
+        #[cfg(not(all(feature = "directml", target_os = "windows")))]
+        let regression_is_normalized = false;
 
         let mut predictions = Vec::with_capacity(images.len());
         for (row, width) in rows.into_iter().zip(original_sizes) {
@@ -136,7 +275,13 @@ impl FontDetector {
 
             let regression = row[REGRESSION_START..REGRESSION_START + REGRESSION_DIM]
                 .iter()
-                .map(|&value| sigmoid_scalar(value))
+                .map(|&value| {
+                    if regression_is_normalized {
+                        value
+                    } else {
+                        sigmoid_scalar(value)
+                    }
+                })
                 .collect::<Vec<_>>();
             let clamp01 = |v: f32| v.clamp(0.0, 1.0);
             let text_color = [

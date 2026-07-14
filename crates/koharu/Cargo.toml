@@ -51,6 +51,8 @@ winreg = { workspace = true }
 [features]
 cuda = ["koharu-app/cuda"]
 metal = ["koharu-app/metal"]
+directml = ["koharu-app/directml"]
+vulkan-ncnn = ["koharu-app/vulkan-ncnn"]
 
 [build-dependencies]
 tauri-build = { workspace = true }

@@ -87,24 +87,49 @@ async function setupCl() {
   )
 }
 
-async function dev() {
-  if (os.type() === 'Windows_NT') {
-    // First, try to check if nvcc is available
-    await checkNvcc()
-      // If not found, try to set up CUDA paths
-      .catch(async () => {
-        await setupCuda()
-        // Check again after setup
-        await checkNvcc()
-      })
+async function setupLibclang() {
+  if (process.env.LIBCLANG_PATH) return
 
-    // Setup cl.exe path
-    await setupCl()
+  const candidates = [
+    'C:/Program Files/LLVM/bin',
+    'C:/Program Files/Microsoft Visual Studio/2022/Community/VC/Tools/Llvm/x64/bin',
+    'C:/Program Files/Microsoft Visual Studio/2022/BuildTools/VC/Tools/Llvm/x64/bin',
+  ]
+  for (const candidate of candidates) {
+    if (await pathExists(path.join(candidate, 'libclang.dll'))) {
+      process.env.LIBCLANG_PATH = candidate
+      process.env.PATH = `${candidate}${path.delimiter}${process.env.PATH}`
+      return
+    }
   }
 
+  throw new Error(
+    'libclang.dll not found. Install LLVM with: winget install LLVM.LLVM',
+  )
+}
+
+async function dev() {
   const args = process.argv.slice(2)
   if (args.length === 0) {
     throw new Error('No command provided')
+  }
+
+  if (os.type() === 'Windows_NT') {
+    const directmlBuild = args.some((arg) => arg.includes('directml'))
+    if (!directmlBuild) {
+      // First, try to check if nvcc is available
+      await checkNvcc()
+        // If not found, try to set up CUDA paths
+        .catch(async () => {
+          await setupCuda()
+          // Check again after setup
+          await checkNvcc()
+        })
+    }
+
+    // Setup cl.exe path
+    await setupCl()
+    await setupLibclang()
   }
 
   const proc = spawn(args[0], args.slice(1), {

@@ -1,9 +1,11 @@
 mod fft;
 mod model;
 
+#[cfg(all(feature = "directml", target_os = "windows"))]
+use anyhow::Context;
 use anyhow::{Result, bail};
 use candle_core::{DType, Device, Tensor};
-use image::{DynamicImage, GenericImageView, GrayImage, RgbImage};
+use image::{DynamicImage, GenericImageView, GrayImage, RgbImage, imageops};
 use koharu_runtime::RuntimeManager;
 use tracing::instrument;
 
@@ -18,6 +20,8 @@ use crate::{
 };
 
 const HF_REPO: &str = "mayocream/lama-manga";
+#[cfg(all(feature = "directml", target_os = "windows"))]
+const ONNX_HF_REPO: &str = "mayocream/lama-manga-onnx";
 const BLOCK_WINDOW_RATIO: f64 = 1.7;
 const BLOCK_WINDOW_ASPECT_RATIO: f64 = 1.0;
 
@@ -31,13 +35,78 @@ koharu_runtime::declare_hf_model_package!(
     order: 130,
 );
 
+#[cfg(all(feature = "directml", target_os = "windows"))]
+koharu_runtime::declare_hf_model_package!(
+    id: "model:lama:onnx",
+    repo: "mayocream/lama-manga-onnx",
+    file: "lama-manga.onnx",
+    bootstrap: false,
+    order: 129,
+);
+
 pub struct Lama {
-    model: model::Lama,
+    backend: LamaBackend,
     device: Device,
+}
+
+enum LamaBackend {
+    Candle(model::Lama),
+    #[cfg(all(feature = "vulkan-ncnn", target_os = "windows"))]
+    Ncnn(crate::comic_text_detector::ncnn::NcnnDetector),
+    #[cfg(all(feature = "directml", target_os = "windows"))]
+    DirectMl(std::sync::Mutex<ort::session::Session>),
 }
 
 impl Lama {
     pub async fn load(runtime: &RuntimeManager, cpu: bool) -> Result<Self> {
+        #[cfg(all(feature = "vulkan-ncnn", target_os = "windows"))]
+        if !cpu {
+            match crate::comic_text_detector::ncnn::NcnnDetector::load_model(
+                "lama_256",
+                "lama-manga",
+            ) {
+                Ok(ncnn) => {
+                    return Ok(Self {
+                        backend: LamaBackend::Ncnn(ncnn),
+                        device: Device::Cpu,
+                    });
+                }
+                Err(error) => tracing::warn!(%error, "ncnn Vulkan LaMa backend unavailable"),
+            }
+        }
+        #[cfg(all(feature = "directml", target_os = "windows"))]
+        if !cpu {
+            let model_path = runtime
+                .downloads()
+                .huggingface_model(ONNX_HF_REPO, "lama-manga.onnx")
+                .await?;
+            let session = (|| -> ort::Result<ort::session::Session> {
+                let builder = ort::session::Session::builder()?;
+                let device_id = std::env::var("KOHARU_DIRECTML_DEVICE_ID")
+                    .ok()
+                    .and_then(|value| value.parse::<i32>().ok())
+                    .unwrap_or(0);
+                let mut builder =
+                    builder.with_execution_providers([ort::ep::DirectML::default()
+                        .with_device_id(device_id)
+                        .build()
+                        .error_on_failure()])?;
+                builder.commit_from_file(&model_path)
+            })();
+            match session {
+                Ok(session) => {
+                    tracing::info!("using DirectML for LaMa inpainting");
+                    return Ok(Self {
+                        backend: LamaBackend::DirectMl(std::sync::Mutex::new(session)),
+                        device: Device::Cpu,
+                    });
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "DirectML initialization failed; falling back to Candle");
+                }
+            }
+        }
+
         let device = device(cpu)?;
         let weights_path = runtime
             .downloads()
@@ -47,7 +116,10 @@ impl Lama {
             model::Lama::load(&vb)
         })?;
 
-        Ok(Self { model, device })
+        Ok(Self {
+            backend: LamaBackend::Candle(model),
+            device,
+        })
     }
 
     /// Run inpainting with the manga-tuned default strategy (Crop, 800/128/1280).
@@ -159,11 +231,25 @@ impl Lama {
 
     #[instrument(level = "debug", skip_all)]
     fn forward(&self, image: &Tensor, mask: &Tensor) -> Result<Tensor> {
-        self.model.forward(image, mask)
+        match &self.backend {
+            LamaBackend::Candle(model) => model.forward(image, mask),
+            #[cfg(all(feature = "vulkan-ncnn", target_os = "windows"))]
+            LamaBackend::Ncnn(_) => bail!("ncnn tensors are handled by inference_model"),
+            #[cfg(all(feature = "directml", target_os = "windows"))]
+            LamaBackend::DirectMl(_) => bail!("DirectML tensors are handled by inference_model"),
+        }
     }
 
     #[instrument(level = "debug", skip_all)]
     fn inference_model(&self, image: &RgbImage, mask: &GrayImage) -> Result<RgbImage> {
+        #[cfg(all(feature = "vulkan-ncnn", target_os = "windows"))]
+        if let LamaBackend::Ncnn(ncnn) = &self.backend {
+            return ncnn_inference(ncnn, image, mask);
+        }
+        #[cfg(all(feature = "directml", target_os = "windows"))]
+        if let LamaBackend::DirectMl(session) = &self.backend {
+            return directml_inference(session, image, mask);
+        }
         let (image_tensor, mask_tensor) = self.preprocess(image, mask)?;
         let output = self.forward(&image_tensor, &mask_tensor)?;
         self.postprocess(&output)
@@ -203,6 +289,111 @@ impl Lama {
         RgbImage::from_raw(width as u32, height as u32, raw)
             .ok_or_else(|| anyhow::anyhow!("failed to create image buffer from model output"))
     }
+}
+
+#[cfg(all(feature = "vulkan-ncnn", target_os = "windows"))]
+fn ncnn_inference(
+    ncnn: &crate::comic_text_detector::ncnn::NcnnDetector,
+    image: &RgbImage,
+    mask: &GrayImage,
+) -> Result<RgbImage> {
+    const SIZE: u32 = 256;
+    let original_size = image.dimensions();
+    let resized_image = if original_size == (SIZE, SIZE) {
+        image.clone()
+    } else {
+        imageops::resize(image, SIZE, SIZE, imageops::FilterType::Triangle)
+    };
+    let resized_mask = if mask.dimensions() == (SIZE, SIZE) {
+        mask.clone()
+    } else {
+        imageops::resize(mask, SIZE, SIZE, imageops::FilterType::Nearest)
+    };
+    let pixels = (SIZE * SIZE) as usize;
+    let mut image_chw = vec![0.0f32; pixels * 3];
+    for (index, pixel) in resized_image.pixels().enumerate() {
+        image_chw[index] = f32::from(pixel[0]) / 255.0;
+        image_chw[pixels + index] = f32::from(pixel[1]) / 255.0;
+        image_chw[pixels * 2 + index] = f32::from(pixel[2]) / 255.0;
+    }
+    let mut mask_chw = resized_mask
+        .pixels()
+        .map(|pixel| if pixel[0] > 1 { 1.0 } else { 0.0 })
+        .collect::<Vec<f32>>();
+    let output = ncnn.forward_two_inputs(
+        &mut image_chw,
+        3,
+        &mut mask_chw,
+        1,
+        SIZE as i32,
+        SIZE as i32,
+        "out0",
+    )?;
+    if output.len() != pixels * 3 {
+        bail!("unexpected ncnn LaMa output size: {}", output.len());
+    }
+    let mut raw = vec![0u8; pixels * 3];
+    for index in 0..pixels {
+        raw[index * 3] = (output[index] * 255.0).clamp(0.0, 255.0) as u8;
+        raw[index * 3 + 1] = (output[pixels + index] * 255.0).clamp(0.0, 255.0) as u8;
+        raw[index * 3 + 2] = (output[pixels * 2 + index] * 255.0).clamp(0.0, 255.0) as u8;
+    }
+    let result = RgbImage::from_raw(SIZE, SIZE, raw)
+        .ok_or_else(|| anyhow::anyhow!("failed to create ncnn LaMa output image"))?;
+    if original_size == (SIZE, SIZE) {
+        Ok(result)
+    } else {
+        Ok(imageops::resize(
+            &result,
+            original_size.0,
+            original_size.1,
+            imageops::FilterType::Triangle,
+        ))
+    }
+}
+
+#[cfg(all(feature = "directml", target_os = "windows"))]
+fn directml_inference(
+    session: &std::sync::Mutex<ort::session::Session>,
+    image: &RgbImage,
+    mask: &GrayImage,
+) -> Result<RgbImage> {
+    let (width, height) = image.dimensions();
+    let pixels = (width as usize) * (height as usize);
+    let mut image_chw = vec![0.0f32; pixels * 3];
+    for (index, pixel) in image.pixels().enumerate() {
+        image_chw[index] = f32::from(pixel[0]) / 255.0;
+        image_chw[pixels + index] = f32::from(pixel[1]) / 255.0;
+        image_chw[pixels * 2 + index] = f32::from(pixel[2]) / 255.0;
+    }
+    let mask_chw = mask
+        .pixels()
+        .map(|pixel| if pixel[0] > 1 { 1.0f32 } else { 0.0 })
+        .collect::<Vec<_>>();
+
+    let image_tensor =
+        ort::value::Tensor::from_array(([1usize, 3, height as usize, width as usize], image_chw))?;
+    let mask_tensor =
+        ort::value::Tensor::from_array(([1usize, 1, height as usize, width as usize], mask_chw))?;
+    let mut session = session
+        .lock()
+        .map_err(|_| anyhow::anyhow!("DirectML session lock is poisoned"))?;
+    let outputs = session.run(ort::inputs!["image" => image_tensor, "mask" => mask_tensor])?;
+    let (shape, values) = outputs[0]
+        .try_extract_tensor::<f32>()
+        .context("LaMa DirectML output is not an f32 tensor")?;
+    if &shape[..] != [1, 3, height as i64, width as i64].as_slice() {
+        bail!("unexpected LaMa DirectML output shape: {shape:?}");
+    }
+
+    let mut raw = vec![0u8; pixels * 3];
+    for index in 0..pixels {
+        raw[index * 3] = (values[index] * 255.0).clamp(0.0, 255.0) as u8;
+        raw[index * 3 + 1] = (values[pixels + index] * 255.0).clamp(0.0, 255.0) as u8;
+        raw[index * 3 + 2] = (values[pixels * 2 + index] * 255.0).clamp(0.0, 255.0) as u8;
+    }
+    RgbImage::from_raw(width, height, raw)
+        .ok_or_else(|| anyhow::anyhow!("failed to create DirectML output image"))
 }
 
 /// [`InpaintForward`] impl used by the HD-strategy dispatcher. Applies the
