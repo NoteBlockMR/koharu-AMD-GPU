@@ -33,6 +33,7 @@ OCR, 인페인팅, LLM을 하나의 데스크톱 애플리케이션으로 결합
 이 포크는 Windows의 AMD GPU에서 다음 엔진을 ncnn Vulkan으로 실행하도록 수정했습니다.
 
 - 만화 텍스트 감지 및 분할
+- Anime Text YOLO (N) 텍스트 블록 감지
 - 말풍선 영역 분할
 - YuzuMarker 글꼴 및 색상 감지
 - LaMa 만화 인페인팅

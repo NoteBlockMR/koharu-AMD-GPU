@@ -111,9 +111,10 @@ impl std::fmt::Display for AnimeTextYoloVariant {
     }
 }
 
-#[derive(Debug)]
 pub struct AnimeTextDetector {
-    model: Yolo12,
+    model: Option<Yolo12>,
+    #[cfg(all(feature = "vulkan-ncnn", target_os = "windows"))]
+    ncnn: Option<crate::comic_text_detector::ncnn::NcnnDetector>,
     variant: AnimeTextYoloVariant,
     device: Device,
     dtype: DType,
@@ -158,6 +159,27 @@ impl AnimeTextDetector {
         variant: AnimeTextYoloVariant,
         cpu: bool,
     ) -> Result<Self> {
+        #[cfg(all(feature = "vulkan-ncnn", target_os = "windows"))]
+        if !cpu && variant == AnimeTextYoloVariant::N {
+            match crate::comic_text_detector::ncnn::NcnnDetector::load_model(
+                "anime_text_yolo12n",
+                "anime text YOLO",
+            ) {
+                Ok(ncnn) => {
+                    return Ok(Self {
+                        model: None,
+                        ncnn: Some(ncnn),
+                        variant,
+                        device: Device::Cpu,
+                        dtype: DType::F32,
+                    });
+                }
+                Err(error) => tracing::warn!(
+                    %error,
+                    "ncnn Vulkan anime text backend unavailable; falling back to Candle"
+                ),
+            }
+        }
         let weights_path = resolve_model_path(runtime, variant).await?;
         Self::load_from_path(weights_path, variant, cpu)
     }
@@ -184,7 +206,9 @@ impl AnimeTextDetector {
         })?;
 
         Ok(Self {
-            model,
+            model: Some(model),
+            #[cfg(all(feature = "vulkan-ncnn", target_os = "windows"))]
+            ncnn: None,
             variant,
             device,
             dtype,
@@ -209,7 +233,31 @@ impl AnimeTextDetector {
     ) -> Result<AnimeTextDetection> {
         let started = Instant::now();
         let prepared = self.preprocess(image)?;
-        let outputs = self.model.forward(&prepared.pixel_values)?;
+        #[cfg(all(feature = "vulkan-ncnn", target_os = "windows"))]
+        let outputs = if let Some(ncnn) = &self.ncnn {
+            let mut input = prepared.pixel_values.flatten_all()?.to_vec1::<f32>()?;
+            let mut outputs = ncnn.forward_outputs(&mut input, 640, 640, &["out0"])?;
+            let output = outputs.pop().context("ncnn anime text output missing")?;
+            if output.len() != (4 + NUM_CLASSES) * 8400 {
+                bail!(
+                    "unexpected ncnn anime text output length {}, expected {}",
+                    output.len(),
+                    (4 + NUM_CLASSES) * 8400
+                );
+            }
+            Tensor::from_vec(output, (1, 4 + NUM_CLASSES, 8400), &Device::Cpu)?
+        } else {
+            self.model
+                .as_ref()
+                .context("anime text backend missing")?
+                .forward(&prepared.pixel_values)?
+        };
+        #[cfg(not(all(feature = "vulkan-ncnn", target_os = "windows")))]
+        let outputs = self
+            .model
+            .as_ref()
+            .context("anime text backend missing")?
+            .forward(&prepared.pixel_values)?;
         let regions = postprocess(&outputs, &prepared, confidence_threshold, nms_threshold)?;
         let text_blocks = regions_to_text_blocks(&regions);
 
